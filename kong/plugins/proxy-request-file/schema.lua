@@ -9,6 +9,7 @@ return {
         fields = {
           -- NOTE: any field added here must be also included in the handler's get_queue_id method
           { http_endpoint = typedefs.url({ required = true }) },
+		  { temp_dest_path = { type = "string", default = "/usr/local/kong/logs/" }, },
           { method = { type = "string", default = "POST", one_of = { "POST", "PUT", "PATCH" }, }, },
           { content_type = { type = "string", default = "application/json", one_of = { "application/json" }, }, },
           { timeout = { type = "number", default = 10000 }, },

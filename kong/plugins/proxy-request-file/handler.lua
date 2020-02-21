@@ -56,6 +56,15 @@ local function get_boundary(content_type)
   return string.sub(content_type, b_index + string.len("boundary="))
 end
 
+local function copy_file(src, dest)                                                         
+  local check_file = file_check(src)                                                        
+  if check_file ~= nil then                                                                 
+    os.execute(string.format('cp "%s" "%s"', src, dest))                                    
+  else                                                                                      
+    ngx.log(ngx.WARN, "check file ERRRRROR: ", check_file)                                  
+  end                                                                                       
+end 
+
 -- Parse host url.
 -- @param `url` host url
 -- @return `parsed_url` a table with host details:
@@ -99,7 +108,7 @@ local function dump_table(o)
   end
 end	
 
-local function send_file(self, conf, temp_file)
+local function send_file(self, conf, temp_file, boundary)
   local timeout = conf.timeout
   local keepalive = conf.keepalive
   local content_type = conf.content_type
@@ -124,18 +133,15 @@ local function send_file(self, conf, temp_file)
                   host .. ":" .. tostring(port) .. ": " .. err
     end
   end
-  local respbody = {} -- for the response body  
-  local content_type_value = req_get_headers()[CONTENT_TYPE]
-  local boundary = get_boundary(content_type_value)
+  local respbody = {} -- for the response body    
   local result, respcode, respheaders, respstatus = http.request{
     url = http_endpoint,
     method = "POST",
     headers = {
         ["Content-Type"] =  "multipart/form-data",
-        ["Content-Length"] = #request_body
 		["Boundary-Parser"] =  boundary,
     },
-    source = ltn12.source.file(io.open(pathToLocalFile)),
+    source = ltn12.source.file(io.open(temp_file)),
     sink = ltn12.sink.table(response_body)
   }
   
@@ -183,14 +189,23 @@ function ProxyRequestFileHandler:access(conf)
   ngx.log(ngx.WARN, ">> temp file: " , file_name)                                         
   if not file_name then
     return nil, "failed to get request temporary file"
-  end                                                                                   
+  end                     
+  local content_type_value = req_get_headers()[CONTENT_TYPE]
+  local boundary = get_boundary(content_type_value)  
+  local new_temp_file = conf.temp_dest_path .. boundary:gsub("-", "")
+  copy_file(file_name, new_temp_file)
+  local entry_tab = {
+    file_process = new_temp_file,      -- this will be available as tab.keyone or tab["keyone"]
+    boundary_process = boundary, -- this uses the full syntax
+  }
   local queue_id = get_queue_id(conf)
   local q = queues[queue_id]
   if not q then
     -- batch_max_size <==> conf.queue_size
     local batch_max_size = conf.queue_size or 1
-    local process = function(request_tmp_file)
-      return send_file(self, conf, request_tmp_file)
+    local process = function(entries)
+	  local entr = entries[1]
+      return send_file(self, conf, entr.file_process, entr.boundary_process)
     end
 
     local opts = {
@@ -209,7 +224,7 @@ function ProxyRequestFileHandler:access(conf)
     queues[queue_id] = q
   end
 
-  q:add(file_name)
+  q:add(entry_tab)
 end
 
 return ProxyRequestFileHandler
