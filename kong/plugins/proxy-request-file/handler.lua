@@ -5,6 +5,7 @@ local url = require "socket.url"
 local socket_http = require("socket.http")
 local ltn12 = require("ltn12")
 local resty_http = require "resty.http"
+local mp_lib = require "multipart-post"
 
 local multipart = require "multipart"
 
@@ -54,6 +55,18 @@ local function get_boundary(content_type)
     return
   end
   return string.sub(content_type, b_index + string.len("boundary="))
+end
+
+local function file_check(file_name)
+  ngx.log(ngx.WARN, "check file ", file_name)
+  local file_found=io.open(file_name, "r")
+               
+  if file_found==nil then
+    file_found=file_name .. " ... Error - File Not Found"
+  else                                     
+    file_found=file_name .. " ... File Found"
+  end                    
+  return file_found
 end
 
 local function copy_file(src, dest)                                                         
@@ -108,6 +121,20 @@ local function dump_table(o)
   end
 end	
 
+-- multipart post client                                                                    
+local function multipart_post(url, file_hl, file_size, boundary)                            
+  local mp = mp_lib.gen_request                                                             
+  local H = socket_http.request                                               
+                                                                              
+  local rq = mp{                                                                            
+    request_file = {name = "myfilename", data = ltn12.source.file(file_hl), len = file_size},
+    boundary_parser = boundary                                                               
+  }                                                                                          
+  rq.url = url                                                                               
+  local b,c,h = H(rq)
+  ngx.log(ngx.WARN, "b: ", b, " == c: ", c, " == h: ", h)  
+end
+
 local function send_file(self, conf, temp_file, boundary)
   local timeout = conf.timeout
   local keepalive = conf.keepalive
@@ -133,30 +160,37 @@ local function send_file(self, conf, temp_file, boundary)
                   host .. ":" .. tostring(port) .. ": " .. err
     end
   end
-  local respbody = {} -- for the response body    
-  local result, respcode, respheaders, respstatus = http.request{
-    url = http_endpoint,
-    method = "POST",
-    headers = {
-        ["Content-Type"] =  "multipart/form-data",
-		["Boundary-Parser"] =  boundary,
-    },
-    source = ltn12.source.file(io.open(temp_file)),
-    sink = ltn12.sink.table(response_body)
-  }
   
-  kong.log.info("result: ", result, " - respcode: ", respcode, " - respstatus: ", respstatus)
-  if not respbody then
-    return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err
-  end
-  
-  local success = respstatus < 400
-  local err_msg
-
-  if not success then
-    err_msg = "request to " .. host .. ":" .. tostring(port) ..
-              " returned status code " .. tostring(respstatus) .. " and body " ..
-              response_body
+  local respbody = {} -- for the response body                                               
+  local file_handler = io.open(temp_file)                                                    
+  local file_length = file_handler:seek("end")                                               
+  file_handler:seek("set", 0)                                                                                                                                                           
+  multipart_post(http_endpoint, file_handler, file_length, boundary)                         
+  --[[
+  local result, respcode, respheaders, respstatus = socket_http.request{                    
+    url = http_endpoint,                                                                    
+    method = "POST",                                                                   
+    headers = {                                                                             
+        ["Content-Type"] =  "multipart/form-data",                                          
+        ["Boundary-Parser"] =  boundary,                                               
+        ["Content-Length"] = file_length                                                    
+    },                                                                                      
+    source = ltn12.source.file(io.open(temp_file)),                                         
+    sink = ltn12.sink.table(response_body)                                                  
+  }                                                                                         
+  --]]                                                                                          
+  ngx.log(ngx.WARN, "result: ", result, " - respcode: ", respcode, " - respstatus: ", respstatus)
+  if not respbody then                                                                           
+    return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err        
+  end                                                                                            
+                                                                                                 
+  local success = respcode < 400                                                                 
+  local err_msg                                                                                  
+                                                                                            
+  if not success then                                                                            
+    err_msg = "request to " .. host .. ":" .. tostring(port) ..                                  
+              " returned status code " .. tostring(respstatus) .. " and body " ..                
+              response_body                                                                 
   end
   
   respbody = table.concat(respbody)
@@ -192,7 +226,7 @@ function ProxyRequestFileHandler:access(conf)
   end                     
   local content_type_value = req_get_headers()[CONTENT_TYPE]
   local boundary = get_boundary(content_type_value)  
-  local new_temp_file = conf.temp_dest_path .. boundary:gsub("-", "")
+  local new_temp_file = conf.temp_dest_path .. boundary:gsub("-", "") .. ".tmp"
   copy_file(file_name, new_temp_file)
   local entry_tab = {
     file_process = new_temp_file,      -- this will be available as tab.keyone or tab["keyone"]
