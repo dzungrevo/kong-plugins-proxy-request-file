@@ -121,21 +121,24 @@ local function dump_table(o)
   end
 end	
 
--- multipart post client                                                                    
-local function multipart_post(url, file_hl, file_size, boundary)                            
-  local mp = mp_lib.gen_request                                                             
-  local H = socket_http.request                                               
-                                                                              
-  local rq = mp{                                                                            
+-- multipart post client                                               
+local function multipart_post(url, file_hl, file_size, boundary, tag)
+  local mp = mp_lib.gen_request                                               
+  local H = socket_http.request                                      
+  ngx.log(ngx.WARN, "tag: ", tag)                                                           
+  local rq = mp{                                      
     request_file = {name = "myfilename", data = ltn12.source.file(file_hl), len = file_size},
-    boundary_parser = boundary                                                               
+    boundary_parser = boundary,                                                              
+    type = tag                                                                               
   }                                                                                          
-  rq.url = url                                                                               
-  local b,c,h = H(rq)
-  ngx.log(ngx.WARN, "b: ", b, " == c: ", c, " == h: ", h)  
-end
+  rq.url = url                                                
+  local result, respcode, respheaders, respstatus = H(rq)                                    
+  --ngx.log(ngx.WARN, "b: ", b, " == c: ", c, " == h: ", h)
+  ngx.log(ngx.WARN, "result: ", result, " - respcode: ", respcode, " - respstatus: ", respstatus)
+  return result, respcode, respheaders, respstatus                                               
+end  
 
-local function send_file(self, conf, temp_file, boundary)
+local function send_file(self, conf, temp_file, boundary, tag)
   local timeout = conf.timeout
   local keepalive = conf.keepalive
   local content_type = conf.content_type
@@ -165,7 +168,7 @@ local function send_file(self, conf, temp_file, boundary)
   local file_handler = io.open(temp_file)                                                    
   local file_length = file_handler:seek("end")                                               
   file_handler:seek("set", 0)                                                                                                                                                           
-  multipart_post(http_endpoint, file_handler, file_length, boundary)                         
+  local result, respcode, respheaders, respstatus = multipart_post(http_endpoint, file_handler, file_length, boundary, tag)                         
   --[[
   local result, respcode, respheaders, respstatus = socket_http.request{                    
     url = http_endpoint,                                                                    
@@ -179,7 +182,6 @@ local function send_file(self, conf, temp_file, boundary)
     sink = ltn12.sink.table(response_body)                                                  
   }                                                                                         
   --]]                                                                                          
-  ngx.log(ngx.WARN, "result: ", result, " - respcode: ", respcode, " - respstatus: ", respstatus)
   if not respbody then                                                                           
     return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err        
   end                                                                                            
@@ -190,11 +192,12 @@ local function send_file(self, conf, temp_file, boundary)
   if not success then                                                                            
     err_msg = "request to " .. host .. ":" .. tostring(port) ..                                  
               " returned status code " .. tostring(respstatus) .. " and body " ..                
-              response_body                                                                 
+              response_body     
+  else
+    os.remove(temp_file)  
   end
   
-  respbody = table.concat(respbody)
-  kong.log.info("respbody: ", respbody)
+  kong.log.info("respcode: ", respcode)
   return success, err_msg
 end
 
@@ -215,8 +218,6 @@ local function get_queue_id(conf)
              conf.flush_timeout)
 end
 
-
-
 function ProxyRequestFileHandler:access(conf)                                 
   ngx.req.read_body()                                                         
   local file_name = ngx.req.get_body_file()                                               
@@ -228,19 +229,31 @@ function ProxyRequestFileHandler:access(conf)
   local boundary = get_boundary(content_type_value)  
   local new_temp_file = conf.temp_dest_path .. boundary:gsub("-", "") .. ".tmp"
   copy_file(file_name, new_temp_file)
-  local entry_tab = {
-    file_process = new_temp_file,      -- this will be available as tab.keyone or tab["keyone"]
-    boundary_process = boundary, -- this uses the full syntax
-  }
-  local queue_id = get_queue_id(conf)
-  local q = queues[queue_id]
-  if not q then
-    -- batch_max_size <==> conf.queue_size
-    local batch_max_size = conf.queue_size or 1
-    local process = function(entries)
-	  local entr = entries[1]
-      return send_file(self, conf, entr.file_process, entr.boundary_process)
-    end
+  local ctx = kong.ctx.plugin
+  ctx.temp_file = new_temp_file
+  ctx.boundary = boundary
+end
+
+function ProxyRequestFileHandler:log(conf)  
+  local ctx = kong.ctx.plugin                                                                                              
+  local s_tag = ""                                                                               
+  if ngx.ctx.service ~= nil then                                                                                           
+    s_tag = ngx.ctx.service.tags[0] or ngx.ctx.service.tags[1]                                   
+  end                                                                                                                      
+  local entry_tab = {                                                                                                      
+    file_process = ctx.temp_file,      -- this will be available as tab.keyone or tab["keyone"]  
+    boundary_process = ctx.boundary, -- this uses the full syntax                                                          
+    tag = s_tag                                                                                  
+  }                                                                                                                        
+  local queue_id = get_queue_id(conf)                                                            
+  local q = queues[queue_id]                                                                                               
+  if not q then                                                                                                            
+    -- batch_max_size <==> conf.queue_size                                                                                 
+    local batch_max_size = conf.queue_size or 1                                                  
+    local process = function(entries)                                                                                      
+      local entr = entries[1]                                                                                          
+      return send_file(self, conf, entr.file_process, entr.boundary_process, entr.tag)           
+    end                                                                       
 
     local opts = {
       retry_count    = conf.retry_count,
@@ -260,5 +273,4 @@ function ProxyRequestFileHandler:access(conf)
 
   q:add(entry_tab)
 end
-
 return ProxyRequestFileHandler
