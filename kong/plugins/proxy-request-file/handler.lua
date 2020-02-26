@@ -122,23 +122,24 @@ local function dump_table(o)
 end	
 
 -- multipart post client                                               
-local function multipart_post(url, file_hl, file_size, boundary, tag)
+local function multipart_post(url, file_hl, file_size, entry)
   local mp = mp_lib.gen_request                                               
   local H = socket_http.request                                      
-  ngx.log(ngx.WARN, "tag: ", tag)                                                           
+  ngx.log(ngx.WARN, "tag: ", entry.tag)                                                           
   local rq = mp{                                      
-    request_file = {name = "myfilename", data = ltn12.source.file(file_hl), len = file_size},
-    boundary_parser = boundary,                                                              
-    type = tag                                                                               
+    request_file = {name = "request_body_file", data = ltn12.source.file(file_hl), len = file_size},                                                                             
   }                                                                                          
-  rq.url = url                                                
-  local result, respcode, respheaders, respstatus = H(rq)                                    
+  rq.url = url   
+  rq.headers.boundary_parser = entr.boundary_process
+  rq.headers.service_type = entry.tag
+  rq.headers.username = entry.username
+  local result, respcode, respheaders, respstatus = H(rq)
   --ngx.log(ngx.WARN, "b: ", b, " == c: ", c, " == h: ", h)
   ngx.log(ngx.WARN, "result: ", result, " - respcode: ", respcode, " - respstatus: ", respstatus)
   return result, respcode, respheaders, respstatus                                               
 end  
 
-local function send_file(self, conf, temp_file, boundary, tag)
+local function send_file(self, conf, entry)
   local timeout = conf.timeout
   local keepalive = conf.keepalive
   local content_type = conf.content_type
@@ -163,38 +164,38 @@ local function send_file(self, conf, temp_file, boundary, tag)
                   host .. ":" .. tostring(port) .. ": " .. err
     end
   end
-  
-  local respbody = {} -- for the response body                                               
-  local file_handler = io.open(temp_file)                                                    
+                                                
+  local file_handler = io.open(entry.file_process)                                                    
   local file_length = file_handler:seek("end")                                               
-  file_handler:seek("set", 0)                                                                                                                                                           
-  local result, respcode, respheaders, respstatus = multipart_post(http_endpoint, file_handler, file_length, boundary, tag)                         
+  file_handler:seek("set", 0)                                                                                                                                                          
+  local result, respcode, respheaders, respstatus = multipart_post(http_endpoint, file_handler, file_length, entry)                         
   --[[
   local result, respcode, respheaders, respstatus = socket_http.request{                    
     url = http_endpoint,                                                                    
     method = "POST",                                                                   
     headers = {                                                                             
         ["Content-Type"] =  "multipart/form-data",                                          
-        ["Boundary-Parser"] =  boundary,                                               
+        ["boundary_parser"] =  boundary,     
+		["service_type"] = tag,
         ["Content-Length"] = file_length                                                    
     },                                                                                      
     source = ltn12.source.file(io.open(temp_file)),                                         
     sink = ltn12.sink.table(response_body)                                                  
   }                                                                                         
-  --]]                                                                                          
-  if not respbody then                                                                           
+  --]]                                                                                      
+  if not result then                                                                           
     return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err        
   end                                                                                            
                                                                                                  
-  local success = respcode < 400                                                                 
+  local success = tonumber(respcode) < 400                                                                 
   local err_msg                                                                                  
                                                                                             
   if not success then                                                                            
     err_msg = "request to " .. host .. ":" .. tostring(port) ..                                  
               " returned status code " .. tostring(respstatus) .. " and body " ..                
-              response_body     
+              result     
   else
-    os.remove(temp_file)  
+    os.remove(entry.file_process)  
   end
   
   kong.log.info("respcode: ", respcode)
@@ -235,15 +236,23 @@ function ProxyRequestFileHandler:access(conf)
 end
 
 function ProxyRequestFileHandler:log(conf)  
-  local ctx = kong.ctx.plugin                                                                                              
-  local s_tag = ""                                                                               
+  local ctx = kong.ctx.plugin  
+  if not ctx.temp_file then
+    return nil, "WARNING-LOG: No temporary request file body"
+  end  
+  local s_tag = ""
+  local s_username = ""  
   if ngx.ctx.service ~= nil then                                                                                           
     s_tag = ngx.ctx.service.tags[0] or ngx.ctx.service.tags[1]                                   
-  end                                                                                                                      
+  end        
+  if ngx.ctx.authenticated_consumer ~= nil then
+    s_username = ngx.ctx.authenticated_consumer.username
+  end  
   local entry_tab = {                                                                                                      
     file_process = ctx.temp_file,      -- this will be available as tab.keyone or tab["keyone"]  
     boundary_process = ctx.boundary, -- this uses the full syntax                                                          
-    tag = s_tag                                                                                  
+    tag = s_tag,
+    username = s_username,	
   }                                                                                                                        
   local queue_id = get_queue_id(conf)                                                            
   local q = queues[queue_id]                                                                                               
@@ -252,7 +261,7 @@ function ProxyRequestFileHandler:log(conf)
     local batch_max_size = conf.queue_size or 1                                                  
     local process = function(entries)                                                                                      
       local entr = entries[1]                                                                                          
-      return send_file(self, conf, entr.file_process, entr.boundary_process, entr.tag)           
+      return send_file(self, conf, entr)           
     end                                                                       
 
     local opts = {
